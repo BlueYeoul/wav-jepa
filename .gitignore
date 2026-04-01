@@ -1,0 +1,47 @@
+# VSCode
+.vscode/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Virtual environment
+venv/
+.venv/
+env/
+env.bak/
+
+# Build outputs
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Pytest (if using pytest)
+.pytest_cache/
+.coverage
+htmlcov/
+
+# My testing configs/outputs
+config.yaml
+checkpoint/*.pt
+checkpoints/
+ref/
+
+# Documentation
+docs/
+*.md.tmp
+
+# Environment variables
+.env
