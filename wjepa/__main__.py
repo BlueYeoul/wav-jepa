@@ -7,6 +7,7 @@ Usage:
 
 import sys
 import argparse
+from wjepa.train import main as train_main
 
 
 def main():

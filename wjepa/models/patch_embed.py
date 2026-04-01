@@ -1,19 +1,43 @@
 import torch.nn as nn
 
 
-class PatchEmbed1D(nn.Module):
+class PatchEmbed(nn.Module):
     """
-    1-D sequence → patch tokens.
-
-    Input : (B, C, T)  – C channels, T time steps
-    Output: (B, N, D)  – N = T // patch_size tokens
+    Wav2Vec2 style convolutional feature extractor as Patch Embedding.
+    Total stride = 5 * 2 * 2 * 2 * 2 * 2 * 2 = 320.
+    Output length is T // 320.
     """
 
-    def __init__(self, patch_size=16, in_chans=1, embed_dim=768):
+    def __init__(self, in_chans=1, embed_dim=768, feature_dim=512):
         super().__init__()
-        self.patch_size = patch_size
-        self.proj = nn.Conv1d(in_chans, embed_dim,
-                              kernel_size=patch_size, stride=patch_size)
+        self.patch_size = 320  # Effective patch size
+
+        # Standard Wav2Vec2 feature encoder configuration
+        self.conv_layers = nn.ModuleList([
+            # Layer 0: Conv (in_chans -> 512, 10, 5, p=3)
+            nn.Sequential(
+                nn.Conv1d(in_chans, feature_dim, kernel_size=10, stride=5, padding=3, bias=False),
+                nn.GroupNorm(feature_dim, feature_dim),
+                nn.GELU()
+            ),
+            # Layers 1-4: Conv (512 -> 512, 3, 2, p=1)
+            *[nn.Sequential(
+                nn.Conv1d(feature_dim, feature_dim, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.GELU()
+            ) for _ in range(4)],
+            # Layers 5-6: Conv (512 -> 512, 2, 2, p=0)
+            *[nn.Sequential(
+                nn.Conv1d(feature_dim, feature_dim, kernel_size=2, stride=2, padding=0, bias=False),
+                nn.GELU()
+            ) for _ in range(2)],
+        ])
+        self.proj = nn.Linear(feature_dim, embed_dim)
 
     def forward(self, x):
-        return self.proj(x).transpose(1, 2)   # (B, D, N) → (B, N, D)
+        # Input x: (B, C, T)
+        for layer in self.conv_layers:
+            x = layer(x)
+        # x: (B, feature_dim, N)
+        x = x.transpose(1, 2)  # (B, N, feature_dim)
+        x = self.proj(x)       # (B, N, embed_dim)
+        return x

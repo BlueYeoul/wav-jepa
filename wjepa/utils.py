@@ -47,7 +47,10 @@ def init_audio_model(
     n_registers_predictor=0,
     has_cls_first=False,
     n_output_distillation=4,
+    **kwargs,
 ):
+    # Note: AudioTransformer now uses Wav2Vec2-style PatchEmbed which fixes patch_size to 320.
+    # The patch_size passed here is kept for compatibility but overridden in the backbone.
     enc = audio_enc_module.__dict__[model_name](
         seq_len=seq_len,
         patch_size=patch_size,
@@ -65,9 +68,12 @@ def init_audio_model(
     )
     encoder = MultiSeqWrapper(enc)
 
+    # Use the actual patch_size from the encoder for the predictor
+    actual_patch_size = encoder.backbone.patch_size
+
     pred = audio_pred_module.audio_predictor(
         seq_len=seq_len,
-        patch_size=patch_size,
+        patch_size=actual_patch_size,
         embed_dim=encoder.backbone.embed_dim,
         predictor_embed_dim=pred_embed_dim,
         depth=pred_depth,

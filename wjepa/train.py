@@ -14,13 +14,13 @@ import time
 import numpy as np
 import torch
 import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel
 
 from wjepa.loss import LambdaWarmupHold, forward_context, forward_target, loss_fn
 from wjepa.masks.collator import MaskCollator
 from wjepa.masks.distance import compute_mask_distance
 from wjepa.models.utils import apply_masks
-from wjepa.utils import init_opt, init_video_model, load_checkpoint, save_checkpoint
+from wjepa.models import EMBED_DIMS
+from wjepa.utils import init_opt, init_audio_model, load_checkpoint, save_checkpoint
 
 log_freq = 10
 CHECKPOINT_FREQ = 1
@@ -96,12 +96,7 @@ def main(args, resume_preempt=False):
     modality_embedding = cfgs_model.get("modality_embedding", False)
     levels_predictor = cfgs_model.get("levels_predictor", 4)
 
-    embed_dim_map = {
-        "vit_large": 1024,
-        "vit_giant_xformers": 1408,
-        "vit_gigantic_xformers": 1664,
-    }
-    embed_dim_encoder = embed_dim_map.get(model_name)
+    embed_dim_encoder = EMBED_DIMS.get(model_name)
     if embed_dim_encoder is None:
         raise ValueError(f"Unrecognized model_name: {model_name}")
 
@@ -111,13 +106,10 @@ def main(args, resume_preempt=False):
     dataset_paths = cfgs_data.get("datasets", [])
     datasets_weights = cfgs_data.get("datasets_weights")
     dataset_fpcs = cfgs_data.get("dataset_fpcs")
-    max_num_frames = max(dataset_fpcs)
     batch_size = cfgs_data.get("batch_size")
     tubelet_size = cfgs_data.get("tubelet_size")
     fps = cfgs_data.get("fps")
-    crop_size = cfgs_data.get("crop_size", 224)
     patch_size = cfgs_data.get("patch_size")
-    grid_size = crop_size // patch_size
     pin_mem = cfgs_data.get("pin_mem", False)
     num_workers = cfgs_data.get("num_workers", 1)
 
@@ -179,43 +171,13 @@ def main(args, resume_preempt=False):
     except Exception:
         pass
 
-    from wjepa.distributed import init_distributed
-    world_size, rank = init_distributed()
-    data_world_size, data_rank = world_size, rank
-    img_world_size = 0
+    # Single-process execution
+    world_size, rank = 1, 0
+    data_world_size, data_rank = 1, 0
     model_fpcs = dataset_fpcs
     model_cfgs_mask = cfgs_mask
     model_tubelet_size = tubelet_size
-
-    if cfgs_img_data is not None:
-        img_world_size = int(world_size * img_rank_ratio)
-        num_video_ranks = world_size - img_world_size
-        img_total_batch_size = img_dataset_batch_size * world_size
-        video_total_batch_size = batch_size * world_size
-        batch_size = video_total_batch_size // num_video_ranks
-
-        if rank < img_world_size:
-            crop_size = cfgs_img_data.get("crop_size", 512)
-            grid_size = crop_size // patch_size
-            if img_temporal_dim_size is not None:
-                tubelet_size = 1
-            dataset_type = img_dataset_type
-            dataset_paths = img_dataset_paths
-            datasets_weights = img_dataset_weights
-            dataset_fpcs = img_dataset_fpcs
-            batch_size = img_dataset_batch_size
-            num_workers = img_num_workers
-            if img_mask is not None:
-                cfgs_mask = img_mask
-            data_rank = rank
-            data_world_size = img_world_size
-            lambda_value = lambda_value_img
-        else:
-            data_rank = rank - img_world_size
-            data_world_size = world_size - img_world_size
-            lambda_value = lambda_value_vid
-    else:
-        lambda_value = lambda_value_vid
+    lambda_value = lambda_value_vid
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
@@ -244,18 +206,15 @@ def main(args, resume_preempt=False):
     # ---------------------------------------------------------------------- #
     #  Model
     # ---------------------------------------------------------------------- #
-
-    encoder, predictor = init_video_model(
-        uniform_power=uniform_power,
+    print(len(model_cfgs_mask), model_fpcs)
+    encoder, predictor = init_audio_model(
         use_mask_tokens=use_mask_tokens,
-        num_mask_tokens=int(len(model_cfgs_mask) * len(model_fpcs)),
+        num_mask_tokens=int(len(model_cfgs_mask)),
         zero_init_mask_tokens=zero_init_mask_tokens,
         device=device,
         patch_size=patch_size,
-        max_num_frames=max_num_frames,
         tubelet_size=model_tubelet_size,
         model_name=model_name,
-        crop_size=crop_size,
         pred_depth=pred_depth,
         pred_num_heads=pred_num_heads,
         pred_embed_dim=pred_embed_dim,
@@ -293,23 +252,9 @@ def main(args, resume_preempt=False):
     mask_collator = MaskCollator(
         cfgs_mask=cfgs_mask,
         dataset_fpcs=dataset_fpcs,
-        crop_size=crop_size,
-        patch_size=patch_size,
-        tubelet_size=tubelet_size,
     )
 
     from wjepa.data import init_data
-    from wjepa.transforms import make_transforms
-
-    transform = make_transforms(
-        random_horizontal_flip=True,
-        random_resize_aspect_ratio=args.get("data_aug", {}).get("random_resize_aspect_ratio", [3/4, 4/3]),
-        random_resize_scale=args.get("data_aug", {}).get("random_resize_scale", [0.3, 1.0]),
-        reprob=args.get("data_aug", {}).get("reprob", 0.0),
-        auto_augment=args.get("data_aug", {}).get("auto_augment", False),
-        motion_shift=args.get("data_aug", {}).get("motion_shift", False),
-        crop_size=crop_size,
-    )
 
     unsupervised_loader, unsupervised_sampler = init_data(
         data=dataset_type,
@@ -318,7 +263,6 @@ def main(args, resume_preempt=False):
         training=True,
         dataset_fpcs=dataset_fpcs,
         fps=fps,
-        transform=transform,
         rank=data_rank,
         world_size=data_world_size,
         datasets_weights=datasets_weights,
@@ -361,9 +305,7 @@ def main(args, resume_preempt=False):
         eps=eps,
     )
 
-    encoder = DistributedDataParallel(encoder, static_graph=True)
-    predictor = DistributedDataParallel(predictor, static_graph=False, find_unused_parameters=True)
-    target_encoder = DistributedDataParallel(target_encoder)
+    # Models running in single-process mode
     for p in target_encoder.parameters():
         p.requires_grad = False
 
@@ -483,7 +425,8 @@ def main(args, resume_preempt=False):
                         d_weights = None
                         if weight_distance_loss:
                             d_weights = compute_mask_distance(
-                                masks_pred, masks_enc, grid_size, offset_context_loss
+                                masks_pred, masks_enc,
+                                seq_len = clips[0].shape[1] if len(clips) > 0 else 0
                             )
                         loss_context = loss_fn(
                             z_context, h, masks_enc, loss_exp, d_weights=d_weights

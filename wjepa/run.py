@@ -31,9 +31,9 @@ def parse_args() -> Dict[str, Any]:
     parser.add_argument("--dataset-type", type=str, default="audio",
                         help="Dataset type (audio, video, etc.)")
     parser.add_argument("--seq-len", type=int, default=16000,
-                        help="Sequence length")
-    parser.add_argument("--patch-size", type=int, default=16,
-                        help="Patch size")
+                        help="Sequence length (time steps)")
+    parser.add_argument("--patch-size", type=int, default=320,
+                        help="Patch size (effective stride of Wav2Vec2 feature extractor)")
     parser.add_argument("--batch-size", type=int, default=32,
                         help="Batch size per GPU")
     parser.add_argument("--num-workers", type=int, default=4,
@@ -46,8 +46,6 @@ def parse_args() -> Dict[str, Any]:
                         help="Model type")
     parser.add_argument("--in-chans", type=int, default=1,
                         help="Input channels")
-    parser.add_argument("--seq-len", type=int, default=1024,
-                        help="Sequence length for transformer")
     parser.add_argument("--embed-dim", type=int, default=768,
                         help="Embedding dimension")
     parser.add_argument("--depth", type=int, default=12,
@@ -107,7 +105,7 @@ def get_default_config() -> Dict[str, Any]:
         # Dataset
         "dataset_type": "audio",
         "seq_len": 16000,
-        "patch_size": 16,
+        "patch_size": 320,
         "batch_size": 32,
         "num_workers": 4,
         # Model

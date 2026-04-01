@@ -1,0 +1,96 @@
+# W-JEPA Audio Pre-training Configuration (Base Model)
+# Based on V-JEPA 2.1 architecture adapted for audio
+
+app: wjepa_audio
+nodes: 1
+tasks_per_node: 1
+cpus_per_task: 8
+mem_per_gpu: 24G
+folder: /your_folder/librispeech_pretrain_base/
+
+data:
+  dataset_type: AudioDataset
+  datasets:
+      - /data/LibriSpeech
+  batch_size: 96
+  dataset_fpcs:
+     - 1
+  num_workers: 8
+  pin_mem: true
+
+data_aug:
+  auto_augment: false
+  random_resize_aspect_ratio:
+     - 0.75
+     - 1.35
+  random_resize_scale:
+     - 0.3
+     - 1.0
+  reprob: 0.0
+
+loss:
+  loss_exp: 1.0
+  predict_all: true
+  shift_by_n: 0
+  weight_distance_loss: true
+
+mask:
+  - aspect_ratio:
+      - 0.75
+      - 1.33
+    full_complement: false
+    max_keep: null
+    num_blocks: 8
+    scale:
+      - 0.15
+      - 0.5
+  - aspect_ratio:
+      - 0.75
+      - 1.33
+    full_complement: false
+    max_keep: null
+    num_blocks: 2
+    scale:
+      - 0.7
+      - 0.7
+
+meta:
+  dtype: float32
+  eval_freq: 10
+  load_checkpoint: false
+  read_checkpoint: null
+  save_every_freq: 50
+  seed: 42
+  use_sdpa: true
+
+model:
+  has_cls_first: false
+  interpolate_rope: false
+  is_causal: false
+  lambda_value_vid: 0.5
+  model_name: audio_transformer_base
+  n_registers: 0
+  n_registers_predictor: 0
+  normalize_predictor: false
+  pred_depth: 6
+  pred_embed_dim: 384
+  pred_is_causal: false
+  uniform_power: true
+  use_activation_checkpointing: false
+  use_mask_tokens: true
+  use_rope: false
+  zero_init_mask_tokens: true
+
+optimization:
+  ema:
+     - 0.999
+     - 0.999
+  epochs: 1000
+  final_lr: 0.0001
+  final_weight_decay: 0.01
+  ipe: 1250
+  ipe_scale: 1.25
+  lr: 0.0001
+  start_lr: 0.00001
+  warmup: 20
+  weight_decay: 0.01

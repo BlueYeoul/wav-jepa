@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 from .modules import Block
-from .patch_embed import PatchEmbed1D
+from .patch_embed import PatchEmbed
 from .utils import apply_masks, trunc_normal_
 
 
@@ -50,12 +50,14 @@ class AudioTransformer(nn.Module):
         self.num_features = self.embed_dim = embed_dim
         self.num_heads    = num_heads
         self.init_type    = init_type
-        self.patch_size   = patch_size
+
+        # Wav2Vec2 style feature extractor as patch embedding
+        self.patch_embed = PatchEmbed(in_chans=in_chans, embed_dim=embed_dim)
+        self.patch_size = self.patch_embed.patch_size  # Fixed at 320
+
         self.use_rope     = use_rope
         self.use_activation_checkpointing = use_activation_checkpointing
-
-        self.num_patches = seq_len // patch_size
-        self.patch_embed = PatchEmbed1D(patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+        self.num_patches = seq_len // self.patch_size
 
         # learned positional embedding (used when use_rope=False)
         if not use_rope:
@@ -186,26 +188,26 @@ class AudioTransformer(nn.Module):
 # Factory functions
 # ---------------------------------------------------------------------------
 
-def audio_transformer_base(patch_size=16, **kwargs):
-    return AudioTransformer(patch_size=patch_size, embed_dim=768, depth=12, num_heads=12,
+def audio_transformer_base(**kwargs):
+    return AudioTransformer(embed_dim=768, depth=12, num_heads=12,
                             mlp_ratio=4, qkv_bias=True,
                             norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
 
 
-def audio_transformer_large(patch_size=16, **kwargs):
-    return AudioTransformer(patch_size=patch_size, embed_dim=1024, depth=24, num_heads=16,
+def audio_transformer_large(**kwargs):
+    return AudioTransformer(embed_dim=1024, depth=24, num_heads=16,
                             mlp_ratio=4, qkv_bias=True,
                             norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
 
 
-def audio_transformer_large_rope(patch_size=16, **kwargs):
-    return AudioTransformer(patch_size=patch_size, embed_dim=1024, depth=24, num_heads=16,
+def audio_transformer_large_rope(**kwargs):
+    return AudioTransformer(embed_dim=1024, depth=24, num_heads=16,
                             mlp_ratio=4, qkv_bias=True, use_rope=True,
                             norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
 
 
-def audio_transformer_giant(patch_size=16, **kwargs):
-    return AudioTransformer(patch_size=patch_size, embed_dim=1408, depth=40, num_heads=22,
+def audio_transformer_giant(**kwargs):
+    return AudioTransformer(embed_dim=1408, depth=40, num_heads=22,
                             mlp_ratio=48/11, qkv_bias=True,
                             norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
 

@@ -1,12 +1,11 @@
 from .encoder import (
-    VisionTransformer,
-    vit_large,
-    vit_large_rope,
-    vit_giant_xformers,
-    vit_giant_xformers_rope,
-    vit_gigantic_xformers,
-    VIT_EMBED_DIMS,
+    AudioTransformer,
+    audio_transformer_base,
+    audio_transformer_large,
+    audio_transformer_large_rope,
+    audio_transformer_giant,
+    EMBED_DIMS,
 )
-from .predictor import VisionTransformerPredictor, vit_predictor
+from .predictor import AudioTransformerPredictor, audio_predictor
 from .wrappers import MultiSeqWrapper, PredictorMultiSeqWrapper
 from .utils import apply_masks, trunc_normal_, repeat_interleave_batch
