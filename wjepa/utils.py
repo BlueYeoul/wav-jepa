@@ -1,8 +1,9 @@
 """
-V-JEPA 2.1 training utilities:
-  init_video_model  – build encoder + predictor
+W-JEPA training utilities:
+  init_audio_model  – build encoder + predictor
   init_opt          – build optimizer / scheduler / scaler
   load_checkpoint   – restore model + optimizer state
+  save_checkpoint   – persist model + optimizer state
 """
 
 import logging
@@ -23,10 +24,8 @@ logger = logging.getLogger(__name__)
 
 def init_audio_model(
     device,
-    seq_len=16000,
-    patch_size=16,
     in_chans=1,
-    model_name="audio_transformer_large",
+    model_name="audio_transformer_base",
     pred_depth=6,
     pred_num_heads=None,
     pred_embed_dim=384,
@@ -34,7 +33,6 @@ def init_audio_model(
     num_mask_tokens=2,
     zero_init_mask_tokens=True,
     use_sdpa=True,
-    use_rope=False,
     use_silu=False,
     use_pred_silu=False,
     wide_silu=True,
@@ -47,20 +45,21 @@ def init_audio_model(
     n_registers_predictor=0,
     has_cls_first=False,
     n_output_distillation=4,
-    **kwargs,
+    **kwargs,   # absorb any remaining video-era kwargs
 ):
-    # Note: AudioTransformer now uses Wav2Vec2-style PatchEmbed which fixes patch_size to 320.
-    # The patch_size passed here is kept for compatibility but overridden in the backbone.
+    """
+    Build encoder (MultiSeqWrapper) and predictor (PredictorMultiSeqWrapper).
+
+    No seq_len or patch_size needed: the feature extractor stride is fixed at 320,
+    and RoPE handles positional encoding for arbitrary input lengths.
+    """
     enc = audio_enc_module.__dict__[model_name](
-        seq_len=seq_len,
-        patch_size=patch_size,
         in_chans=in_chans,
         use_sdpa=use_sdpa,
         use_silu=use_silu,
         wide_silu=wide_silu,
         use_activation_checkpointing=use_activation_checkpointing,
         is_causal=is_causal,
-        use_rope=use_rope,
         init_type=init_type,
         n_registers=n_registers,
         has_cls_first=has_cls_first,
@@ -68,12 +67,7 @@ def init_audio_model(
     )
     encoder = MultiSeqWrapper(enc)
 
-    # Use the actual patch_size from the encoder for the predictor
-    actual_patch_size = encoder.backbone.patch_size
-
     pred = audio_pred_module.audio_predictor(
-        seq_len=seq_len,
-        patch_size=actual_patch_size,
         embed_dim=encoder.backbone.embed_dim,
         predictor_embed_dim=pred_embed_dim,
         depth=pred_depth,
@@ -81,7 +75,6 @@ def init_audio_model(
         use_mask_tokens=use_mask_tokens,
         num_mask_tokens=num_mask_tokens,
         zero_init_mask_tokens=zero_init_mask_tokens,
-        use_rope=use_rope,
         is_causal=pred_is_causal,
         use_silu=use_pred_silu,
         wide_silu=wide_silu,
@@ -134,19 +127,19 @@ def init_opt(
         {
             "params": (
                 p for n, p in encoder.named_parameters()
-                if ("bias" not in n) and (len(p.shape) != 1)
+                if ("bias" not in n) and (len(p.shape) != 1) and not n.endswith(".raw")
             )
         },
         {
             "params": (
                 p for n, p in predictor.named_parameters()
-                if ("bias" not in n) and (len(p.shape) != 1)
+                if ("bias" not in n) and (len(p.shape) != 1) and not n.endswith(".raw")
             )
         },
         {
             "params": (
                 p for n, p in encoder.named_parameters()
-                if ("bias" in n) or (len(p.shape) == 1)
+                if ("bias" in n) or (len(p.shape) == 1) or n.endswith(".raw")
             ),
             "WD_exclude": zero_init_bias_wd,
             "weight_decay": 0,
@@ -154,7 +147,7 @@ def init_opt(
         {
             "params": (
                 p for n, p in predictor.named_parameters()
-                if ("bias" in n) or (len(p.shape) == 1)
+                if ("bias" in n) or (len(p.shape) == 1) or n.endswith(".raw")
             ),
             "WD_exclude": zero_init_bias_wd,
             "weight_decay": 0,
@@ -195,12 +188,13 @@ def init_opt(
         T_max=T_max,
     )
 
-    scaler = torch.cuda.amp.GradScaler() if mixed_precision else None
+    scaler = torch.amp.GradScaler("cuda") if mixed_precision else None
+
     return optimizer, scaler, scheduler, wd_scheduler
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint
+# Checkpoint helpers
 # ---------------------------------------------------------------------------
 
 def load_checkpoint(r_path, encoder, predictor, target_encoder, opt, scaler, is_anneal=False):

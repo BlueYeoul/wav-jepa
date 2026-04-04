@@ -1,5 +1,5 @@
 """
-V-JEPA 2.1 pre-training loss primitives.
+W-JEPA pre-training loss primitives.
 
   forward_target    : EMA target encoder (no_grad + per-level LayerNorm)
   forward_context   : context encoder → predictor
@@ -19,10 +19,7 @@ from .models.utils import apply_masks
 # ---------------------------------------------------------------------------
 
 def _normalize_level(tensor, embed_dim, n_levels=4):
-    """
-    LayerNorm each embed_dim-sized chunk along the last axis, then concat.
-    Matches normalize_and_concat() in the original codebase (hardcoded n_levels=4).
-    """
+    """LayerNorm each embed_dim-sized chunk along the last axis, then concat."""
     chunks = [
         F.layer_norm(tensor[:, :, i * embed_dim:(i + 1) * embed_dim], (embed_dim,))
         for i in range(n_levels)
@@ -61,8 +58,7 @@ def forward_target(clips, target_encoder, embed_dim, levels_predictor):
 
 
 def forward_context(clips, masks_enc, masks_pred, encoder, predictor,
-                    embed_dim, normalize_predictor, predict_all,
-                    img_temporal_dim_size=None):
+                    embed_dim, normalize_predictor, predict_all):
     """
     Context encoder → predictor forward.
 
@@ -70,12 +66,8 @@ def forward_context(clips, masks_enc, masks_pred, encoder, predictor,
         z_pred    : nested list [fpc][mask] – predicted target tokens
         z_context : nested list [fpc][mask] – predicted context tokens (or None)
     """
-    modality = "video"
-    if img_temporal_dim_size is not None and clips[0].shape[2] == img_temporal_dim_size:
-        modality = "image"
-
     z = encoder(clips, masks_enc, gram_mode=False, training_mode=True)
-    z_pred, z_context = predictor(z, masks_enc, masks_pred, mod=modality)
+    z_pred, z_context = predictor(z, masks_enc, masks_pred)
 
     if normalize_predictor:
         z_pred = _normalize_nested(z_pred, embed_dim)
@@ -138,8 +130,7 @@ def loss_fn(z, h, masks_to_apply, loss_exp, d_weights=None, has_cls_first=False)
 
 class LambdaWarmupHold:
     """
-    0  →  lambda_value  linearly over [start_iter, end_iter],
-    then constant.
+    0  →  lambda_value  linearly over [start_iter, end_iter], then constant.
     """
 
     def __init__(self, lambda_value: float, start_iter: int = 15_000, end_iter: int = 30_000):

@@ -1,0 +1,24 @@
+# syncr ignore patterns (like .gitignore)
+# Lines starting with # are comments
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+.venv
+venv
+*.egg-info
+
+# Data / models (usually too large)
+# data/
+# checkpoints/
+# *.pt
+# *.pth
+
+# System
+.DS_Store
+*.tmp
+*.log
+
+ref/
+.*/

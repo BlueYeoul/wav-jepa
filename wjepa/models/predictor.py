@@ -1,3 +1,14 @@
+"""
+AudioTransformerPredictor for W-JEPA 1-D pre-training.
+
+Given masked context tokens from the encoder, predicts target tokens.
+Positional encoding is handled entirely by RoPE inside each Block –
+no learned positional embedding is stored here.
+
+When return_all_tokens=True the predictor also outputs predictions for
+the context tokens (used for the optional context loss λ).
+"""
+
 import math
 from functools import partial
 
@@ -9,17 +20,8 @@ from .utils import apply_masks, repeat_interleave_batch, trunc_normal_
 
 
 class AudioTransformerPredictor(nn.Module):
-    """
-    Predictor for W-JEPA 1-D pre-training.
-
-    Given masked context tokens from the encoder, predicts target tokens.
-    When return_all_tokens=True also predicts context tokens (context loss).
-    """
-
     def __init__(
         self,
-        seq_len=16000,
-        patch_size=16,
         embed_dim=768,
         predictor_embed_dim=384,
         out_embed_dim=None,
@@ -41,19 +43,17 @@ class AudioTransformerPredictor(nn.Module):
         is_causal=False,
         use_activation_checkpointing=False,
         return_all_tokens=False,
-        use_rope=False,
         n_registers=0,
         has_cls_first=False,
         n_output_distillation=4,
-        **kwargs,
+        **kwargs,  # absorb unused kwargs (seq_len, patch_size from old configs)
     ):
         super().__init__()
         self.return_all_tokens = return_all_tokens
         self.has_cls_first     = has_cls_first
-        self.use_rope          = use_rope
         self.use_activation_checkpointing = use_activation_checkpointing
 
-        # ---- hierarchical output layers ------------------------------------
+        # Hierarchical output layer indices
         _layer_map = {
             4:  [0, 1, 2, 3],
             8:  [1, 3, 5, 7],
@@ -65,10 +65,7 @@ class AudioTransformerPredictor(nn.Module):
         assert depth in _layer_map, f"Unsupported predictor depth {depth}"
         self.hierarchical_layers = _layer_map[depth][-n_output_distillation:]
 
-        # ---- dimensions ----------------------------------------------------
-        self.num_patches = seq_len // patch_size
-
-        # ---- input projection ----------------------------------------------
+        # Input projection
         act_layer_mlp = nn.SiLU if use_silu else nn.GELU
         n_levels = len(self.hierarchical_layers)
         if n_levels == 1:
@@ -80,7 +77,7 @@ class AudioTransformerPredictor(nn.Module):
                 nn.Linear(embed_dim, predictor_embed_dim, bias=True),
             )
 
-        # ---- mask tokens ---------------------------------------------------
+        # Learnable mask tokens (one per mask config)
         self.mask_tokens    = None
         self.num_mask_tokens = 0
         if use_mask_tokens:
@@ -90,14 +87,9 @@ class AudioTransformerPredictor(nn.Module):
                 for _ in range(num_mask_tokens)
             ])
 
-        # ---- positional embeddings (learned, only when use_rope=False) -----
-        if not use_rope:
-            self.predictor_pos_embed = nn.Parameter(
-                torch.zeros(1, self.num_patches, predictor_embed_dim)
-            )
-            nn.init.trunc_normal_(self.predictor_pos_embed, std=0.02)
+        # No predictor_pos_embed: RoPE is applied inside each Block
 
-        # ---- transformer blocks --------------------------------------------
+        # Transformer blocks (always RoPE)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         self.predictor_blocks = nn.ModuleList([
             Block(
@@ -114,14 +106,14 @@ class AudioTransformerPredictor(nn.Module):
                 norm_layer=norm_layer,
                 use_sdpa=True,
                 is_causal=is_causal,
-                use_rope=use_rope,
+                use_rope=True,      # always RoPE for audio
                 n_registers=n_registers,
                 has_cls_first=has_cls_first,
             )
             for i in range(depth)
         ])
 
-        # ---- output projection ---------------------------------------------
+        # Output projection
         if out_embed_dim is None:
             out_embed_dim = embed_dim
         self.predictor_norm = norm_layer(predictor_embed_dim)
@@ -133,7 +125,6 @@ class AudioTransformerPredictor(nn.Module):
                 predictor_embed_dim, n_levels * out_embed_dim, bias=True
             )
 
-        # ---- init ----------------------------------------------------------
         self.init_std = init_std
         if use_mask_tokens and not zero_init_mask_tokens:
             for mt in self.mask_tokens:
@@ -161,59 +152,63 @@ class AudioTransformerPredictor(nn.Module):
 
     def forward(self, x, masks_x, masks_y, mask_index=0, **kwargs):
         """
-        x       : context tokens from encoder  (B*n_ctx, N_ctx, D)
-        masks_x : list of (B, K_ctx) – context token indices
-        masks_y : list of (B, K_tgt) – target token indices
+        Args:
+            x       : context tokens from encoder  (B, N_ctx, D*L)
+            masks_x : list of (B, K_ctx) – context token indices in original sequence
+            masks_y : list of (B, K_tgt) – target token indices in original sequence
 
-        Returns (z_pred, z_context):
-            z_pred    : predicted target tokens   (B*n_ctx, K_tgt, D_out*L)
-            z_context : predicted context tokens  (B*n_ctx, K_ctx, D_out*L)  or None
+        Returns:
+            z_pred    : (B, K_tgt, D_out*L)  predicted target tokens
+            z_context : (B, K_ctx, D_out*L)  predicted context tokens, or None
         """
         if not isinstance(masks_x, list): masks_x = [masks_x]
         if not isinstance(masks_y, list): masks_y = [masks_y]
 
         B = len(x) // len(masks_x)
 
-        # project to predictor space
-        x = self.predictor_embed(x)
+        # Project to predictor space
+        x = self.predictor_embed(x)    # (B, N_ctx, predictor_embed_dim)
         _, N_ctxt, D = x.shape
 
-        # mask tokens for targets
+        # Build target mask tokens dynamically (size = max token index + 1)
         mask_index = mask_index % max(self.num_mask_tokens, 1)
+        masks_y_cat = torch.cat(masks_y, dim=0)                      # (B*n_masks, K_tgt)
+        max_idx = int(masks_y_cat.max().item()) + 1                   # dynamic upper bound
+
         if self.mask_tokens is not None:
-            pred_tokens = self.mask_tokens[mask_index].repeat(B, self.num_patches, 1)
+            pred_tokens = self.mask_tokens[mask_index].expand(
+                B * len(masks_x), max_idx, -1
+            ).clone()
         else:
-            pred_tokens = torch.zeros(B, self.num_patches, D, device=x.device, dtype=x.dtype)
-        pred_tokens = apply_masks(pred_tokens, masks_y)
+            pred_tokens = torch.zeros(
+                B * len(masks_x), max_idx, D, device=x.device, dtype=x.dtype
+            )
+        pred_tokens = apply_masks(pred_tokens, masks_y)               # (B*n, K_tgt, D)
+        # No positional embedding added here — RoPE uses position indices from masks
 
-        if not self.use_rope:
-            x_pos      = self.predictor_pos_embed.expand(B, -1, -1)
-            x          = x + apply_masks(x_pos, masks_x)
-            pos_embs   = apply_masks(self.predictor_pos_embed.expand(B, -1, -1), masks_y)
-            pos_embs   = repeat_interleave_batch(pos_embs, B, repeat=len(masks_x))
-            pred_tokens = pred_tokens + pos_embs
+        # Repeat context for each mask config and concatenate with target tokens
+        x = x.repeat(len(masks_x), 1, 1)                             # (B*n, N_ctx, D)
+        x = torch.cat([x, pred_tokens], dim=1)                        # (B*n, N_ctx+K_tgt, D)
 
-        # concatenate context + target and sort by position index
-        x = x.repeat(len(masks_x), 1, 1)
-        x = torch.cat([x, pred_tokens], dim=1)
-
-        masks_x_cat = torch.cat(masks_x, dim=0)
-        masks_y_cat = torch.cat(masks_y, dim=0)
-        masks       = torch.cat([masks_x_cat, masks_y_cat], dim=1)
+        # Merge position index lists and sort so attention sees tokens in order
+        masks_x_cat = torch.cat(masks_x, dim=0)                      # (B*n, K_ctx)
+        masks       = torch.cat([masks_x_cat, masks_y_cat], dim=1)   # (B*n, K_ctx+K_tgt)
 
         argsort = torch.argsort(masks, dim=1)
         masks   = torch.stack([masks[i, row] for i, row in enumerate(argsort)])
         x       = torch.stack([x[i, row, :] for i, row in enumerate(argsort)])
 
-        # predictor transformer
+        # Predictor transformer (RoPE positions = sorted token indices)
         for blk in self.predictor_blocks:
             if self.use_activation_checkpointing:
-                x, _ = torch.utils.checkpoint.checkpoint(blk, x, masks, use_reentrant=False)
+                x, _ = torch.utils.checkpoint.checkpoint(
+                    blk, x, masks, use_reentrant=False
+                )
             else:
                 x, _ = blk(x, mask=masks)
         x = self.predictor_norm(x)
 
-        # restore original ordering
+        # Restore original ordering
         reverse = torch.argsort(argsort, dim=1)
         x = torch.stack([x[i, row, :] for i, row in enumerate(reverse)])
 

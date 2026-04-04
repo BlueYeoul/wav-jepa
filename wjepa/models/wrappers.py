@@ -41,8 +41,8 @@ class PredictorMultiSeqWrapper(nn.Module):
         outs_pred    = [[] for _ in x]
         outs_context = [[] for _ in x]
         for i, (x_i, mx_i, my_i) in enumerate(zip(x, masks_x, masks_y)):
-            for xij, mx, my in zip(x_i, mx_i, my_i):
-                z_pred, z_ctx = self.backbone(xij, mx, my, mask_index=i)
+            for j, (xij, mx, my) in enumerate(zip(x_i, mx_i, my_i)):
+                z_pred, z_ctx = self.backbone(xij, mx, my, mask_index=j)
                 outs_pred[i].append(z_pred)
                 outs_context[i].append(z_ctx)
         return outs_pred, outs_context

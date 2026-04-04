@@ -14,7 +14,7 @@ class DistributedSampler(Sampler):
     """
     
     def __init__(self, dataset, num_replicas=None, rank=None, shuffle=True):
-        super().__init__(dataset)
+        super().__init__()
         if num_replicas is None:
             if not dist.is_available():
                 raise RuntimeError("Requires distributed package to be available")
@@ -50,6 +50,9 @@ class DistributedSampler(Sampler):
         
         return iter(indices[start:end])
     
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
     def __len__(self):
         return len(self.dataset) // self.num_replicas
 

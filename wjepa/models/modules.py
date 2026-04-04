@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from timm.models.layers import drop_path
+from timm.layers import drop_path
 
 
 # ---------------------------------------------------------------------------
@@ -142,10 +142,9 @@ class RoPEAttention(nn.Module):
         k = rotate_queries_or_keys(k, pos, self.n_registers, self.has_cls_first)
 
         if self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
-                x = F.scaled_dot_product_attention(
-                    q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal
-                )
+            x = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal
+            )
             attn = None
         else:
             attn = (q @ k.transpose(-2, -1)) * self.scale
@@ -179,10 +178,9 @@ class Attention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         if self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
-                x = F.scaled_dot_product_attention(
-                    q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal
-                )
+            x = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal
+            )
         else:
             attn = self.attn_drop((q @ k.transpose(-2, -1) * self.scale).softmax(dim=-1))
             x = attn @ v

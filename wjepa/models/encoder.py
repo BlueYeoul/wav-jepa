@@ -1,3 +1,16 @@
+"""
+AudioTransformer encoder for W-JEPA pre-training on 1-D audio sequences.
+
+Architecture:
+  - Wav2Vec2-style CNN feature extractor  →  token sequence
+  - Transformer blocks with 1-D RoPE (no learned positional embedding)
+  - Hierarchical output: concatenation of intermediate layer norms
+
+Input  : (B, 1, T)                         raw waveform, variable T
+Output (training=True)  : (B, N, D * L)    hierarchical concat (L levels)
+Output (training=False) : (B, N, D)        last-layer norm only
+"""
+
 import math
 from functools import partial
 
@@ -5,23 +18,13 @@ import torch
 import torch.nn as nn
 
 from .modules import Block
-from .patch_embed import PatchEmbed
+from .feature_extractor import AudioFeatureExtractor
 from .utils import apply_masks, trunc_normal_
 
 
 class AudioTransformer(nn.Module):
-    """
-    Encoder backbone for W-JEPA pre-training on 1-D sequences.
-
-    Input  : (B, C, T)                             – C channels, T time steps
-    Output (training=True) : (B, N, D * L)         – hierarchical concat (L levels)
-    Output (training=False): (B, N, D)              – last-layer norm only
-    """
-
     def __init__(
         self,
-        seq_len=16000,
-        patch_size=16,
         in_chans=1,
         embed_dim=768,
         depth=12,
@@ -39,30 +42,22 @@ class AudioTransformer(nn.Module):
         use_sdpa=True,
         use_activation_checkpointing=False,
         is_causal=False,
-        use_rope=False,
         init_type="default",
         n_registers=0,
         has_cls_first=False,
         n_output_distillation=4,
-        **kwargs,
+        **kwargs,  # absorb unused kwargs (e.g. seq_len, patch_size from old configs)
     ):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
         self.num_heads    = num_heads
         self.init_type    = init_type
 
-        # Wav2Vec2 style feature extractor as patch embedding
-        self.patch_embed = PatchEmbed(in_chans=in_chans, embed_dim=embed_dim)
-        self.patch_size = self.patch_embed.patch_size  # Fixed at 320
+        # CNN feature extractor (Wav2Vec2 style, stride=320)
+        self.patch_embed = AudioFeatureExtractor(in_chans=in_chans, embed_dim=embed_dim)
 
-        self.use_rope     = use_rope
+        # No learned positional embedding – RoPE is applied inside each Block
         self.use_activation_checkpointing = use_activation_checkpointing
-        self.num_patches = seq_len // self.patch_size
-
-        # learned positional embedding (used when use_rope=False)
-        if not use_rope:
-            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
-            nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         self.blocks = nn.ModuleList([
@@ -80,18 +75,18 @@ class AudioTransformer(nn.Module):
                 norm_layer=norm_layer,
                 use_sdpa=use_sdpa,
                 is_causal=is_causal,
-                use_rope=use_rope,
+                use_rope=True,          # always RoPE for audio
                 n_registers=n_registers,
                 has_cls_first=has_cls_first,
             )
             for i in range(depth)
         ])
 
-        # ---- hierarchical output layers ------------------------------------
+        # Hierarchical output layers
         _layer_map = {
-            12: [2,  5,  8,  11],
-            24: [5, 11, 17,  23],
-            40: [9, 19, 29,  39],
+            12: [2,  5,  8, 11],
+            24: [5, 11, 17, 23],
+            40: [9, 19, 29, 39],
             48: [11, 23, 37, 47],
         }
         assert depth in _layer_map, f"Unsupported depth {depth}"
@@ -140,30 +135,35 @@ class AudioTransformer(nn.Module):
         return len(self.blocks)
 
     def no_weight_decay(self):
-        return {"pos_embed"} if not self.use_rope else {}
+        return {}   # no pos_embed to exclude
 
     # ---- forward ------------------------------------------------------------
 
     def forward(self, x, masks=None, training=False):
         """
-        x      : (B, C, T)
-        masks  : list of (B, K) index tensors – context masking (None for target encoder)
-        training: True → return hierarchical concat (B, N, D*L)
-                  False → return last norm only    (B, N, D)
+        Args:
+            x       : (B, 1, T)  raw waveform (variable T, right-zero-padded)
+            masks   : (B, K) index tensor of context tokens, or list of such tensors
+                      None for target encoder (full sequence)
+            training: True  → return hierarchical concat (B, N, D*L)
+                      False → return last norm           (B, N, D)
+
+        RoPE notes:
+            - masks=None  → RoPEAttention uses arange(N) as positions
+            - masks=(B,K) → RoPEAttention uses the K actual token indices as positions
+              This ensures padding tokens are never "seen" as context and that
+              masked context tokens retain their true temporal positions.
         """
         if masks is not None and not isinstance(masks, list):
             masks = [masks]
 
-        x = self.patch_embed(x)             # (B, N, D)
-
-        if not self.use_rope:
-            x = x + self.pos_embed
+        x = self.patch_embed(x)      # (B, N, D) – N depends on actual audio length
 
         if masks is not None:
             x = apply_masks(x, masks)
-            masks_cat = torch.cat(masks, dim=0)
+            masks_cat = torch.cat(masks, dim=0)   # (B*n_masks, K) – positions for RoPE
         else:
-            masks_cat = None
+            masks_cat = None                       # full sequence; RoPE uses arange
 
         hier = []
         for i, blk in enumerate(self.blocks):
@@ -200,21 +200,14 @@ def audio_transformer_large(**kwargs):
                             norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
 
 
-def audio_transformer_large_rope(**kwargs):
-    return AudioTransformer(embed_dim=1024, depth=24, num_heads=16,
-                            mlp_ratio=4, qkv_bias=True, use_rope=True,
-                            norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
-
-
 def audio_transformer_giant(**kwargs):
     return AudioTransformer(embed_dim=1408, depth=40, num_heads=22,
-                            mlp_ratio=48/11, qkv_bias=True,
+                            mlp_ratio=48 / 11, qkv_bias=True,
                             norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
 
 
 EMBED_DIMS = {
-    "audio_transformer_base":       768,
-    "audio_transformer_large":      1024,
-    "audio_transformer_large_rope": 1024,
-    "audio_transformer_giant":      1408,
+    "audio_transformer_base":  768,
+    "audio_transformer_large": 1024,
+    "audio_transformer_giant": 1408,
 }
