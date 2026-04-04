@@ -19,6 +19,32 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# CSV Logger (ported from src/utils/logging.py in V-JEPA 2.1)
+# ---------------------------------------------------------------------------
+
+class CSVLogger:
+
+    def __init__(self, fname, *argv, **kwargs):
+        self.fname = fname
+        self.types = []
+        mode = kwargs.get("mode", "+a")
+        self.delim = kwargs.get("delim", ",")
+        with open(self.fname, mode) as f:
+            for i, v in enumerate(argv, 1):
+                self.types.append(v[0])
+                if i < len(argv):
+                    print(v[1], end=self.delim, file=f)
+                else:
+                    print(v[1], end="\n", file=f)
+
+    def log(self, *argv):
+        with open(self.fname, "+a") as f:
+            for i, tv in enumerate(zip(self.types, argv), 1):
+                end = self.delim if i < len(argv) else "\n"
+                print(tv[0] % tv[1], end=end, file=f)
+
+
+# ---------------------------------------------------------------------------
 # Model init
 # ---------------------------------------------------------------------------
 

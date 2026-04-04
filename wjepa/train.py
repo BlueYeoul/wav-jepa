@@ -26,7 +26,7 @@ from wjepa.masks.distance import compute_mask_distance
 from wjepa.models.utils import apply_masks
 from wjepa.models import EMBED_DIMS
 from wjepa.models.feature_extractor import compute_audio_output_length
-from wjepa.utils import init_opt, init_audio_model, load_checkpoint, save_checkpoint
+from wjepa.utils import init_opt, init_audio_model, load_checkpoint, save_checkpoint, CSVLogger
 
 log_freq = 10
 CHECKPOINT_FREQ = 1
@@ -141,6 +141,7 @@ def main(args, resume_preempt=False):
     use_radamw = cfgs_opt.get("use_radamw", False)
     betas = cfgs_opt.get("betas", (0.9, 0.999))
     eps = cfgs_opt.get("eps", 1.0e-8)
+    effective_batch_size = cfgs_opt.get("effective_batch_size", batch_size)
     loss_reg_std_mult = cfgs_opt.get("loss_reg_std_mult", None)
     loss_reg_num_tracking_steps = cfgs_opt.get("loss_reg_num_tracking_steps", 300)
     loss_reg_min_epoch = cfgs_opt.get("loss_reg_min_epoch", 50)
@@ -171,6 +172,17 @@ def main(args, resume_preempt=False):
     os.makedirs(folder, exist_ok=True)
     log_file = os.path.join(folder, f"log_r{rank}.csv")
     latest_path = os.path.join(folder, "latest.pth.tar")
+
+    csv_logger = CSVLogger(
+        log_file,
+        ("%d", "epoch"),
+        ("%d", "itr"),
+        ("%.5f", "loss"),
+        ("%d", "iter-time(ms)"),
+        ("%d", "gpu-time(ms)"),
+        ("%d", "dataload-time(ms)"),
+        ("%d", "update_step"),
+    )
 
     load_path = None
     if load_model:
@@ -251,7 +263,19 @@ def main(args, resume_preempt=False):
     _dlen = len(unsupervised_loader)
     if ipe is None:
         ipe = _dlen
-    logger.info(f"batch_size={batch_size}  ipe={ipe}/{_dlen}")
+
+    # -- Gradient accumulation --
+    accum_steps = effective_batch_size // batch_size
+    assert effective_batch_size % batch_size == 0, (
+        f"effective_batch_size ({effective_batch_size}) must be "
+        f"divisible by batch_size ({batch_size})"
+    )
+    ipe = (ipe // accum_steps) * accum_steps   # trim to full accumulation cycles
+    upe = ipe // accum_steps                   # update (optimizer) steps per epoch
+    logger.info(
+        f"batch_size={batch_size}  effective_batch={effective_batch_size}  "
+        f"accum_steps={accum_steps}  ipe={ipe}  upe={upe}  dlen={_dlen}"
+    )
 
     # ---------------------------------------------------------------------- #
     #  Optimizer / scheduler
@@ -267,7 +291,7 @@ def main(args, resume_preempt=False):
         start_lr=start_lr,
         ref_lr=lr,
         final_lr=final_lr,
-        iterations_per_epoch=ipe,
+        iterations_per_epoch=upe,
         warmup=warmup,
         num_epochs=num_epochs,
         ipe_scale=ipe_scale,
@@ -280,8 +304,8 @@ def main(args, resume_preempt=False):
         p.requires_grad = False
 
     momentum_scheduler = (
-        ema[0] + i * (ema[1] - ema[0]) / (ipe * num_epochs * ipe_scale)
-        for i in range(int(ipe * num_epochs) + 1)
+        ema[0] + i * (ema[1] - ema[0]) / (upe * num_epochs * ipe_scale)
+        for i in range(int(upe * num_epochs) + 1)
     )
     lambda_sched = LambdaWarmupHold(lambda_value=lambda_value)
 
@@ -300,7 +324,7 @@ def main(args, resume_preempt=False):
             scaler=scaler,
             is_anneal=is_anneal and not resume_anneal,
         )
-        for _ in range(start_epoch * ipe):
+        for _ in range(start_epoch * upe):
             scheduler.step()
             wd_scheduler.step()
             next(momentum_scheduler)
@@ -330,6 +354,7 @@ def main(args, resume_preempt=False):
 
     trailing_losses = []
     step_count = 0
+    global_update_step = start_epoch * upe
 
     for epoch in range(start_epoch, num_epochs):
         logger.info(f"Epoch {epoch + 1}")
@@ -341,6 +366,7 @@ def main(args, resume_preempt=False):
         iter_time_meter = _AverageMeter()
         gpu_time_meter = _AverageMeter()
         data_time_meter = _AverageMeter()
+        _new_lr, _new_wd = start_lr, wd
 
         for itr in range(ipe):
             itr_start = time.time()
@@ -362,13 +388,8 @@ def main(args, resume_preempt=False):
                         raise RuntimeError("Exceeded max data retries.")
 
             # -- unpack collator output and move to device --
-            # sample = (collated_dict, [enc_mask_cfg1, enc_mask_cfg2], [pred_mask_cfg1, pred_mask_cfg2])
             udata, m_enc_list, m_pred_list = sample
-
-            # audio: (B, T) → (B, 1, T) for the CNN feature extractor
             audio = udata["audio"].to(device, non_blocking=True).unsqueeze(1)
-
-            # Wrap in outer list for MultiSeqWrapper (one audio group, multiple mask configs)
             clips      = [audio]
             masks_enc  = [[m.to(device, non_blocking=True) for m in m_enc_list]]
             masks_pred = [[m.to(device, non_blocking=True) for m in m_pred_list]]
@@ -378,39 +399,49 @@ def main(args, resume_preempt=False):
             if sync_gc and (itr + 1) % GARBAGE_COLLECT_ITR_FREQ == 0:
                 gc.collect()
 
-            # ----------------------------------------------------------------
-            def train_step():
+            # -- Forward + scaled backward (gradient accumulation) ---------
+            t0 = time.time()
+
+            with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
+                h = forward_target(clips, target_encoder, embed_dim_encoder, levels_predictor)
+                z_pred, z_context = forward_context(
+                    clips, masks_enc, masks_pred,
+                    encoder, predictor,
+                    embed_dim_encoder, normalize_predictor, predict_all,
+                )
+
+                loss = loss_fn(z_pred, h, masks_pred, loss_exp, has_cls_first=has_cls_first)
+
+                if predict_all and z_context is not None:
+                    d_weights = None
+                    if weight_distance_loss:
+                        seq_len_tokens = int(udata["seq_len"].max().item())
+                        d_weights = compute_mask_distance(
+                            masks_pred, masks_enc, seq_len=seq_len_tokens
+                        )
+                    loss_context = loss_fn(
+                        z_context, h, masks_enc, loss_exp, d_weights=d_weights
+                    )
+                    lambda_t = (
+                        lambda_sched.value(epoch * ipe + itr)
+                        if lambda_progressive
+                        else lambda_value
+                    )
+                    loss = loss + loss_context * lambda_t
+
+            # Backward with accumulation scaling
+            scaled_loss = loss / accum_steps
+            if mixed_precision:
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
+
+            # -- Optimizer step only on accumulation boundary --------------
+            is_update_step = (itr + 1) % accum_steps == 0
+
+            if is_update_step:
                 _new_lr = scheduler.step()
                 _new_wd = wd_scheduler.step()
-
-                with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
-                    h = forward_target(clips, target_encoder, embed_dim_encoder, levels_predictor)
-                    z_pred, z_context = forward_context(
-                        clips, masks_enc, masks_pred,
-                        encoder, predictor,
-                        embed_dim_encoder, normalize_predictor, predict_all,
-                    )
-
-                    loss_pred = loss_fn(z_pred, h, masks_pred, loss_exp, has_cls_first=has_cls_first)
-                    loss = loss_pred
-
-                    if predict_all and z_context is not None:
-                        d_weights = None
-                        if weight_distance_loss:
-                            # Use max token count (from max audio length in batch) as seq_len proxy
-                            seq_len_tokens = int(udata["seq_len"].max().item())
-                            d_weights = compute_mask_distance(
-                                masks_pred, masks_enc, seq_len=seq_len_tokens
-                            )
-                        loss_context = loss_fn(
-                            z_context, h, masks_enc, loss_exp, d_weights=d_weights
-                        )
-                        lambda_t = (
-                            lambda_sched.value(epoch * ipe + itr)
-                            if lambda_progressive
-                            else lambda_value
-                        )
-                        loss = loss + loss_context * lambda_t
 
                 run_step = True
                 if loss_reg_std_mult is not None and len(trailing_losses) > 0:
@@ -423,21 +454,15 @@ def main(args, resume_preempt=False):
                         and len(trailing_losses) > int(0.5 * loss_reg_num_tracking_steps)
                     ):
                         run_step = False
-                        logger.info(f"Loss {loss:.4f} > bound {bound:.4f}; skipping step.")
+                        logger.info(f"Loss {float(loss):.4f} > bound {bound:.4f}; skipping update.")
 
                 if run_step:
                     if mixed_precision:
-                        scaler.scale(loss).backward()
                         scaler.unscale_(optimizer)
-                    else:
-                        loss.backward()
-                    if mixed_precision:
                         scaler.step(optimizer)
                         scaler.update()
                     else:
                         optimizer.step()
-                else:
-                    loss.backward()
                 optimizer.zero_grad()
 
                 # EMA update of target encoder
@@ -448,42 +473,54 @@ def main(args, resume_preempt=False):
                     torch._foreach_mul_(params_k, m)
                     torch._foreach_add_(params_k, params_q, alpha=1.0 - m)
 
-                return float(loss), _new_lr, _new_wd, run_step
-            # ----------------------------------------------------------------
+                global_update_step += 1
 
-            t0 = time.time()
-            loss, _new_lr, _new_wd, run_step = train_step()
+                # Loss regulation tracking
+                if loss_reg_std_mult is not None:
+                    if run_step:
+                        trailing_losses.append(float(loss))
+                        if len(trailing_losses) > loss_reg_num_tracking_steps:
+                            trailing_losses = trailing_losses[1:]
+                    else:
+                        step_count += 1
+                        if step_count > MAX_REPEAT_COUNTS:
+                            raise RuntimeError("Loss above bound for too many consecutive steps.")
+
+            # -- Timing & meters ------------------------------------------
             gpu_ms = (time.time() - t0) * 1000.0
             iter_ms = (time.time() - itr_start) * 1000.0
 
-            loss_meter.update(loss)
+            loss_val = float(loss)
+            loss_meter.update(loss_val)
             iter_time_meter.update(iter_ms)
             gpu_time_meter.update(gpu_ms)
             data_time_meter.update(data_time_ms)
 
-            if loss_reg_std_mult is not None:
-                if run_step:
-                    trailing_losses.append(loss)
-                    if len(trailing_losses) > loss_reg_num_tracking_steps:
-                        trailing_losses = trailing_losses[1:]
-                else:
-                    step_count += 1
-                    if step_count > MAX_REPEAT_COUNTS:
-                        raise RuntimeError("Loss above bound for too many consecutive steps.")
+            csv_logger.log(
+                epoch + 1,
+                itr,
+                loss_val,
+                iter_ms,
+                gpu_ms,
+                data_time_ms,
+                global_update_step,
+            )
 
             if itr % log_freq == 0 or itr == ipe - 1:
                 logger.info(
                     "[%d, %5d] loss: %.3f  wd: %.2e  lr: %.2e  "
-                    "mem: %.0fMB  iter: %.1fms  gpu: %.1fms  data: %.1fms"
+                    "mem: %.0fMB  iter: %.1fms  gpu: %.1fms  data: %.1fms  "
+                    "ustep: %d"
                     % (
                         epoch + 1, itr, loss_meter.avg,
                         _new_wd, _new_lr,
                         torch.cuda.max_memory_allocated() / 1024**2 if torch.cuda.is_available() else 0,
                         iter_time_meter.avg, gpu_time_meter.avg, data_time_meter.avg,
+                        global_update_step,
                     )
                 )
 
-            assert not np.isnan(loss), "loss is NaN"
+            assert not np.isnan(loss_val), "loss is NaN"
 
         # -- Save checkpoint --
         logger.info(f"avg. loss {loss_meter.avg:.3f}")

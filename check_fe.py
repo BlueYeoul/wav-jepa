@@ -195,6 +195,8 @@ def run_models(fe, ema, audio_path=None, n_samples=4, sr=16000, device="cpu"):
     with torch.no_grad():
         for label, x in inputs:
             fe_out = fe(x)[0]          # (N, D)
+            print(f"Processed {label}: FE output shape {fe_out.mean(dim=1)}")
+            print(f"Processed {label}: FE output {fe_out.mean(dim=1)}")
             if ema is not None:
                 # MultiSeqWrapper: masks=None → [backbone(x_i) for x_i in clips]
                 # backbone returns (B, N, D), so squeeze batch dim
