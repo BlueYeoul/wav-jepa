@@ -246,10 +246,11 @@ def load_checkpoint(r_path, encoder, predictor, target_encoder, opt, scaler, is_
     if target_encoder is not None:
         _load(target_encoder, "target_encoder")
 
-    try:
-        opt.load_state_dict(checkpoint["opt"])
-    except ValueError:
-        logger.warning("Optimizer groups mismatch; reinitializing optimizer.")
+    if opt is not None:
+        try:
+            opt.load_state_dict(checkpoint["opt"])
+        except ValueError:
+            logger.warning("Optimizer groups mismatch; reinitializing optimizer.")
 
     if scaler is not None and checkpoint.get("scaler") is not None:
         scaler.load_state_dict(checkpoint["scaler"])

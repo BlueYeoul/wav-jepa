@@ -33,13 +33,13 @@ data:
 #   cfg2: one large block    → aggressive masking
 mask:
   - num_blocks: 8
-    scale: [0.15, 0.5]
+    scale: [0.05, 0.2]
     max_keep: null
     full_complement: false
     max_temporal_keep: 1.0
     inv_block: false
-  - num_blocks: 2
-    scale: [0.7, 0.7]
+  - num_blocks: 1
+    scale: [0.4, 0.55]
     max_keep: null
     full_complement: false
     max_temporal_keep: 1.0
