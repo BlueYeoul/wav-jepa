@@ -87,7 +87,7 @@ optimization:
   weight_decay: 0.01
   final_weight_decay: 0.01
   warmup: 20                # epochs of LR warmup
-  ipe: 10000                 # iterations per epoch (overrides dataset length)
+  ipe: 2400                 # iterations per epoch (overrides dataset length)
   # ipe: 1250                 # iterations per epoch (overrides dataset length)
   ipe_scale: 1.25
   betas: [0.9, 0.999]
