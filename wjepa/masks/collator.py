@@ -21,6 +21,7 @@ class DynamicMaskCollator1D:
         super().__init__()
         self.compute_output_length = compute_output_length
         self.dynamic_config = dynamic_config or {}
+        self.cfgs_mask = cfgs_mask
         self.current_epoch = 0
 
         # Dynamic Masking 설정 추출
@@ -29,7 +30,7 @@ class DynamicMaskCollator1D:
         self.mask_generators = []
         for m in cfgs_mask:
             mask_generator = _MaskGenerator1D(
-                pred_mask_scale=self._get_dynamic_mask_scale(), # 초기 스케일
+                pred_mask_scale=self._get_dynamic_mask_scale(mask_cfg=m), # 초기 스케일
                 npred=m.get("num_blocks", 1),
                 max_context_ratio=m.get("max_temporal_keep", 1.0),
                 max_keep=m.get("max_keep", None),
@@ -39,10 +40,10 @@ class DynamicMaskCollator1D:
             )
             self.mask_generators.append(mask_generator)
 
-    def _get_dynamic_mask_scale(self):
+    def _get_dynamic_mask_scale(self, mask_cfg=None):
         """에포크에 따른 동적 마스크 비율 계산 (Meta 코드에는 없던 스케줄링 추가)"""
         if not self.dynamic_mask_cfg.get("enabled", False):
-            return (0.15, 0.5)
+            return (0.15, 0.5) if mask_cfg is None else mask_cfg.get("scale", (0.15, 0.5))
         
         min_r = self.dynamic_mask_cfg.get("min_mask_ratio", 0.15)
         max_r = self.dynamic_mask_cfg.get("max_mask_ratio", 0.5)

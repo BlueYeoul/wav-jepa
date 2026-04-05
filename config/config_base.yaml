@@ -20,10 +20,10 @@ data:
   pin_mem: true
   dynamic_seq_len:
     enabled: true
-    min_seq_len_sec: 0.5      # 0.5s = 8000 samples → ~24 tokens
-    max_seq_len_sec: 12.0     # 12s  = 192000 samples → ~600 tokens
+    min_seq_len_sec: 2.0      # 2.0s = 32000 samples → ~100 tokens
+    max_seq_len_sec: 10.0     # 10s  = 160000 samples → ~1000 tokens
   dynamic_mask:
-    enabled: true
+    enabled: False
     min_mask_ratio: 0.15
     max_mask_ratio: 0.5
     warmup_epochs: 20
@@ -87,7 +87,8 @@ optimization:
   weight_decay: 0.01
   final_weight_decay: 0.01
   warmup: 20                # epochs of LR warmup
-  ipe: 1250                 # iterations per epoch (overrides dataset length)
+  ipe: 100000                 # iterations per epoch (overrides dataset length)
+  # ipe: 1250                 # iterations per epoch (overrides dataset length)
   ipe_scale: 1.25
   betas: [0.9, 0.999]
   eps: 1.0e-8
